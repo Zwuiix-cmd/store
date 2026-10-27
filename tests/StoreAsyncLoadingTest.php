@@ -28,6 +28,10 @@ use pocketmine\utils\MainLogger;
 use ReflectionClass;
 use ReflectionProperty;
 use zwuiix\store\EncryptedStore;
+use zwuiix\store\security\StoreEncryptionOptions;
+use zwuiix\store\security\StoreKdf;
+use zwuiix\store\security\StoreKey;
+use zwuiix\store\security\StoreKeyring;
 use zwuiix\store\Store;
 use zwuiix\store\StoreFormat;
 
@@ -73,7 +77,7 @@ final class StoreAsyncLoadingTest extends TestCase
 		$this->directory = sys_get_temp_dir() . '/store-async-tests-' . bin2hex(random_bytes(6));
 		mkdir($this->directory, 0775, true);
 		$logger = new MainLogger(null, false, 'Store Tests', new DateTimeZone('UTC'));
-		$this->pool = new AsyncPool(1, 1024, new ThreadSafeClassLoader(), $logger, new SleeperHandler());
+		$this->pool = new AsyncPool(2, 1024, new ThreadSafeClassLoader(), $logger, new SleeperHandler());
 
 		$this->serverInstance = new ReflectionProperty(Server::class, 'instance');
 		$this->previousServer = $this->serverInstance->getValue();
@@ -127,6 +131,51 @@ final class StoreAsyncLoadingTest extends TestCase
 		self::assertSame(['created' => true], $store->all());
 	}
 
+	public function testAsyncSavingWithNestedArrayValues() : void
+	{
+		$path = $this->directory . '/saved.json';
+		$store = Store::open($path, StoreFormat::Json);
+		$store->set('database', [
+			'host' => 'database.example',
+			'credentials' => ['user' => 'store', 'password' => 'secret'],
+		]);
+
+		$promise = $store->save(async: true);
+		self::assertInstanceOf(Promise::class, $promise);
+		$result = $this->await($promise);
+		self::assertIsArray($result);
+		self::assertSame('resolved', $result['state']);
+		self::assertTrue($result['value']);
+		self::assertSame([
+			'database' => [
+				'host' => 'database.example',
+				'credentials' => ['user' => 'store', 'password' => 'secret'],
+			],
+		], Store::open($path, StoreFormat::Json)->all());
+	}
+
+	public function testConcurrentAsyncSavesKeepTheLatestGeneration() : void
+	{
+		$path = $this->directory . '/save-generations.json';
+		$store = Store::open($path, StoreFormat::Json);
+		$store->set('version', 1);
+		$first = $store->save(async: true);
+		self::assertInstanceOf(Promise::class, $first);
+
+		$store->set('version', 2);
+		$second = $store->save(async: true);
+		self::assertInstanceOf(Promise::class, $second);
+
+		$firstResult = $this->await($first);
+		$secondResult = $this->await($second);
+		self::assertIsArray($firstResult);
+		self::assertIsArray($secondResult);
+		self::assertSame('resolved', $firstResult['state']);
+		self::assertSame('resolved', $secondResult['state']);
+		self::assertTrue($secondResult['value']);
+		self::assertSame(['version' => 2], Store::open($path, StoreFormat::Json)->all());
+	}
+
 	public function testAsyncLoadingMergesNestedDefaults() : void
 	{
 		$path = $this->directory . '/nested.json';
@@ -154,6 +203,61 @@ final class StoreAsyncLoadingTest extends TestCase
 		self::assertSame(['fallback' => true, 'secret' => 'value'], $store->all());
 	}
 
+	public function testAsyncRemoteLoadingWithNestedDefaults() : void
+	{
+		$cacheFile = $this->directory . '/remote-cache.json';
+		file_put_contents($cacheFile, '{"remote":{"value":42}}');
+		$promise = Store::openRemoteAsync(
+			'https://store-tests.invalid/config.json',
+			StoreFormat::Json,
+			['remote' => ['fallback' => true, 'nested' => ['enabled' => true]]],
+			$cacheFile,
+		);
+
+		$result = $this->await($promise);
+		self::assertIsArray($result);
+		self::assertSame('resolved', $result['state']);
+		$store = $result['value'];
+		self::assertInstanceOf(Store::class, $store);
+		self::assertSame([
+			'remote' => ['fallback' => true, 'nested' => ['enabled' => true], 'value' => 42],
+		], $store->all());
+	}
+
+	public function testAsyncEncryptedKeyringLoadingWithDefaultsAndTransports() : void
+	{
+		$path = $this->directory . '/keyring.store';
+		$options = new StoreEncryptionOptions(kdf: StoreKdf::Raw);
+		$storedKey = StoreKey::random();
+		$created = EncryptedStore::open(
+			$path,
+			defaults: ['stored' => ['value' => 'from-file']],
+			key: $storedKey,
+			encryption: $options,
+		);
+		self::assertSame(['stored' => ['value' => 'from-file']], $created->all());
+
+		$keyring = (new StoreKeyring())
+			->add('wrong', StoreKey::random())
+			->add('stored', $storedKey);
+		$promise = EncryptedStore::openWithKeyringAsync(
+			$path,
+			$keyring,
+			['defaults' => ['fallback' => true]],
+			encryption: $options,
+		);
+
+		$result = $this->await($promise);
+		self::assertIsArray($result);
+		self::assertSame('resolved', $result['state']);
+		$store = $result['value'];
+		self::assertInstanceOf(EncryptedStore::class, $store);
+		self::assertSame([
+			'defaults' => ['fallback' => true],
+			'stored' => ['value' => 'from-file'],
+		], $store->all());
+	}
+
 	public function testInvalidDecodedDataRejectsThePromise() : void
 	{
 		$path = $this->directory . '/invalid.json';
@@ -163,6 +267,40 @@ final class StoreAsyncLoadingTest extends TestCase
 
 		$state = $this->await($promise);
 		self::assertSame('rejected', $state);
+	}
+
+	public function testUnserializableAsyncDefaultsAreRejectedByPocketMineWrapper() : void
+	{
+		$this->expectException(\Throwable::class);
+		Store::load(
+			$this->directory . '/unserializable.json',
+			StoreFormat::Json,
+			['callback' => static fn() : null => null],
+			async: true,
+		);
+	}
+
+	public function testMultipleConcurrentAsyncLoads() : void
+	{
+		$promises = [];
+		for ($index = 0; $index < 4; $index++) {
+			$promises[] = Store::load(
+				$this->directory . '/concurrent-' . $index . '.json',
+				StoreFormat::Json,
+				['concurrent' => ['index' => $index, 'nested' => ['enabled' => true]]],
+				async: true,
+			);
+		}
+
+		foreach ($promises as $index => $promise) {
+			self::assertInstanceOf(Promise::class, $promise);
+			$result = $this->await($promise);
+			self::assertIsArray($result);
+			self::assertSame('resolved', $result['state']);
+			self::assertSame([
+				'concurrent' => ['index' => $index, 'nested' => ['enabled' => true]],
+			], $result['value']->all());
+		}
 	}
 
 	/**
