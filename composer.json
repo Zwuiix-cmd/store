@@ -5,6 +5,11 @@
   "autoload": {
     "classmap": ["src"]
   },
+  "autoload-dev": {
+    "psr-4": {
+      "zwuiix\\store\\tests\\": "tests/"
+    }
+  },
   "authors": [
     {
       "name": "Zwuiix",
@@ -19,7 +24,8 @@
   },
   "require-dev": {
     "friendsofphp/php-cs-fixer": "^3.86",
-    "axolotl-pm/pocketmine-mp": "dev-stable"
+    "axolotl-pm/pocketmine-mp": "dev-stable",
+    "phpunit/phpunit": "^11.5"
   },
   "repositories": [
     {
@@ -29,6 +35,7 @@
     }
   ],
   "scripts": {
+    "test": "@php vendor/bin/phpunit",
     "make": [
       "@composer install --classmap-authoritative --ignore-platform-reqs",
       "@php -dphar.readonly=0 build/compiler.php"

@@ -19,12 +19,14 @@ namespace zwuiix\store\async;
 
 use pocketmine\promise\PromiseResolver;
 use pocketmine\scheduler\AsyncTask;
+use pocketmine\thread\NonThreadSafeValue;
 use Throwable;
 use zwuiix\store\StoreCodecRegistry;
 use zwuiix\store\StoreFormat;
 
 use function dirname;
 use function file_put_contents;
+use function is_array;
 use function is_dir;
 use function is_string;
 use function mkdir;
@@ -49,17 +51,25 @@ final class StoreSaveAsyncTask extends AsyncTask
 	 */
 	public function __construct(
 		private string  $path,
-		/** @var array<string, mixed> */
-		private array   $values,
+		array           $values,
 		StoreFormat     $format,
 		private ?string $passphrase,
 		PromiseResolver $resolver,
 	) {
 		$this->format = $format->value;
+		$this->values = new NonThreadSafeValue($values);
 		$this->storeLocal(self::PROMISE_KEY, $resolver);
 	}
 
 	private string $format;
+
+	/**
+	 * Values transported to the worker through PocketMine's thread-safe wrapper.
+	 *
+	 * NonThreadSafeValue serializes the snapshot internally while keeping the
+	 * task property itself thread-safe.
+	 */
+	private NonThreadSafeValue $values;
 
 	/**
 	 * Encodes and writes the snapshot to a temporary file in the worker.
@@ -73,7 +83,14 @@ final class StoreSaveAsyncTask extends AsyncTask
 	public function onRun() : void
 	{
 		try {
-			$contents = StoreCodecRegistry::get(StoreFormat::from($this->format))->encode($this->values, $this->passphrase);
+			$values = $this->values->deserialize();
+			if (!is_array($values)) {
+				$this->setResult(false);
+
+				return;
+			}
+
+			$contents = StoreCodecRegistry::get(StoreFormat::from($this->format))->encode($values, $this->passphrase);
 			$directory = dirname($this->path);
 			if (!is_dir($directory) && !mkdir($directory, 0775, true) && !is_dir($directory)) {
 				$this->setResult(false);

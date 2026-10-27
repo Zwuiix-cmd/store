@@ -19,10 +19,12 @@ namespace zwuiix\store\async;
 
 use pocketmine\promise\PromiseResolver;
 use pocketmine\scheduler\AsyncTask;
+use pocketmine\thread\NonThreadSafeValue;
 use Throwable;
 use zwuiix\store\StoreCodecRegistry;
 use zwuiix\store\StoreFormat;
 
+use function array_is_list;
 use function array_replace_recursive;
 use function file_get_contents;
 use function is_array;
@@ -43,13 +45,31 @@ final class EncryptedStoreKeyringLoadAsyncTask extends AsyncTask
 	 * @param PromiseResolver<array<string,mixed>> $resolver   Completion resolver.
 	 */
 	public function __construct(
-		private string  $path,
-		private array   $defaults,
-		private array   $transports,
+		private string $path,
+		array         $defaults,
+		array         $transports,
 		PromiseResolver $resolver,
 	) {
+		$this->defaults = new NonThreadSafeValue($defaults);
+		$this->transports = new NonThreadSafeValue($transports);
 		$this->storeLocal(self::PROMISE_KEY, $resolver);
 	}
+
+	/**
+	 * Defaults transported to the worker through PocketMine's thread-safe wrapper.
+	 *
+	 * NonThreadSafeValue serializes the array internally while keeping the task
+	 * property itself thread-safe.
+	 */
+	private NonThreadSafeValue $defaults;
+
+	/**
+	 * Key transports transported to the worker through PocketMine's thread-safe wrapper.
+	 *
+	 * NonThreadSafeValue serializes the list internally while keeping the task
+	 * property itself thread-safe.
+	 */
+	private NonThreadSafeValue $transports;
 
 	/**
 	 * Reads and decrypts with each candidate key in order.
@@ -58,6 +78,27 @@ final class EncryptedStoreKeyringLoadAsyncTask extends AsyncTask
 	 */
 	public function onRun() : void
 	{
+		try {
+			$defaults = $this->defaults->deserialize();
+			$transports = $this->transports->deserialize();
+		} catch (Throwable) {
+			$this->setResult(false);
+
+			return;
+		}
+		if (!is_array($defaults) || !is_array($transports) || !array_is_list($transports)) {
+			$this->setResult(false);
+
+			return;
+		}
+		foreach ($transports as $transport) {
+			if (!is_string($transport)) {
+				$this->setResult(false);
+
+				return;
+			}
+		}
+
 		if (!is_file($this->path)) {
 			$this->setResult(false);
 
@@ -71,11 +112,14 @@ final class EncryptedStoreKeyringLoadAsyncTask extends AsyncTask
 			return;
 		}
 
-		foreach ($this->transports as $index => $transport) {
+		foreach ($transports as $index => $transport) {
 			try {
 				$data = StoreCodecRegistry::get(StoreFormat::Encrypted)->decode($contents, $transport);
+				if (!is_array($data)) {
+					continue;
+				}
 				$this->setResult([
-					'data' => array_replace_recursive($this->defaults, $data),
+					'data' => array_replace_recursive($defaults, $data),
 					'transport' => $transport,
 					'index' => $index,
 				]);

@@ -19,10 +19,12 @@ namespace zwuiix\store\async;
 
 use pocketmine\promise\PromiseResolver;
 use pocketmine\scheduler\AsyncTask;
+use pocketmine\thread\NonThreadSafeValue;
 use Throwable;
 use zwuiix\store\storage\StoreRemote;
 use zwuiix\store\Store;
 use zwuiix\store\StoreFormat;
+use function is_array;
 use function is_string;
 
 /**
@@ -50,7 +52,7 @@ final class StoreRemoteLoadAsyncTask extends AsyncTask
 	public function __construct(
 		private string  $url,
 		StoreFormat     $format,
-		private array   $defaults,
+		array           $defaults,
 		private ?string $cacheFile,
 		private int     $ttl,
 		private int     $timeout,
@@ -61,13 +63,32 @@ final class StoreRemoteLoadAsyncTask extends AsyncTask
 		PromiseResolver $resolver,
 	) {
 		$this->format = $format->value;
+		$this->defaults = new NonThreadSafeValue($defaults);
 		$this->storeLocal(self::PROMISE_KEY, $resolver);
 	}
+
+	/**
+	 * Defaults transported to the worker through PocketMine's thread-safe wrapper.
+	 *
+	 * NonThreadSafeValue serializes the array internally while keeping the task
+	 * property itself thread-safe.
+	 */
+	private NonThreadSafeValue $defaults;
 
 	public function onRun() : void
 	{
 		try {
-			$this->setResult(StoreRemote::fetch($this->url, $this->cacheFile, $this->ttl, $this->timeout, $this->sha256, $this->signature, $this->publicKey));
+			$defaults = $this->defaults->deserialize();
+			if (!is_array($defaults)) {
+				$this->setResult(false);
+
+				return;
+			}
+
+			$this->setResult([
+				'contents' => StoreRemote::fetch($this->url, $this->cacheFile, $this->ttl, $this->timeout, $this->sha256, $this->signature, $this->publicKey),
+				'defaults' => $defaults,
+			]);
 		} catch (Throwable) {
 			$this->setResult(false);
 		}
@@ -77,15 +98,15 @@ final class StoreRemoteLoadAsyncTask extends AsyncTask
 	{
 		/** @var PromiseResolver<Store> $resolver */
 		$resolver = $this->fetchLocal(self::PROMISE_KEY);
-		$contents = $this->getResult();
-		if (!is_string($contents)) {
+		$result = $this->getResult();
+		if (!is_array($result) || !is_string($result['contents'] ?? null) || !is_array($result['defaults'] ?? null)) {
 			$resolver->reject();
 
 			return;
 		}
 
 		try {
-			$resolver->resolve(Store::fromString($contents, StoreFormat::from($this->format), null, $this->passphrase, $this->defaults));
+			$resolver->resolve(Store::fromString($result['contents'], StoreFormat::from($this->format), null, $this->passphrase, $result['defaults']));
 		} catch (Throwable) {
 			$resolver->reject();
 		}

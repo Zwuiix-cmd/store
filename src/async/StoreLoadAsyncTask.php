@@ -19,6 +19,7 @@ namespace zwuiix\store\async;
 
 use pocketmine\promise\PromiseResolver;
 use pocketmine\scheduler\AsyncTask;
+use pocketmine\thread\NonThreadSafeValue;
 use Throwable;
 use zwuiix\store\event\StoreLoadEvent;
 use zwuiix\store\Store;
@@ -58,17 +59,25 @@ final class StoreLoadAsyncTask extends AsyncTask
 	public function __construct(
 		private string  $path,
 		StoreFormat     $format,
-		/** @var array<string, mixed> */
-		private array   $defaults,
+		array           $defaults,
 		private ?string $passphrase,
 		private bool    $dispatchEvents,
 		PromiseResolver $resolver,
 	) {
 		$this->format = $format->value;
+		$this->defaults = new NonThreadSafeValue($defaults);
 		$this->storeLocal(self::PROMISE_KEY, $resolver);
 	}
 
 	private string $format;
+
+	/**
+	 * Defaults transported to the worker through PocketMine's thread-safe wrapper.
+	 *
+	 * NonThreadSafeValue serializes the array internally while keeping the task
+	 * property itself thread-safe.
+	 */
+	private NonThreadSafeValue $defaults;
 
 	/**
 	 * Loads, decodes and, when necessary, creates the Store file in the worker.
@@ -79,9 +88,22 @@ final class StoreLoadAsyncTask extends AsyncTask
 	 */
 	public function onRun() : void
 	{
+		try {
+			$defaults = $this->defaults->deserialize();
+		} catch (Throwable) {
+			$this->setResult(['ok' => false]);
+
+			return;
+		}
+		if (!is_array($defaults)) {
+			$this->setResult(['ok' => false]);
+
+			return;
+		}
+
 		if (!is_file($this->path)) {
 			try {
-				$data = $this->defaults;
+				$data = $defaults;
 				$directory = dirname($this->path);
 				if (!is_dir($directory) && !mkdir($directory, 0775, true) && !is_dir($directory)) {
 					$this->setResult(['ok' => false]);
@@ -120,9 +142,14 @@ final class StoreLoadAsyncTask extends AsyncTask
 		try {
 			chmod($this->path, $this->format === StoreFormat::Encrypted->value ? 0600 : 0640);
 			$data = StoreCodecRegistry::get(StoreFormat::from($this->format))->decode($contents, $this->passphrase);
+			if (!is_array($data)) {
+				$this->setResult(['ok' => false, 'missing' => false]);
+
+				return;
+			}
 			$this->setResult([
 				'ok' => true,
-				'data' => array_replace_recursive($this->defaults, $data),
+				'data' => array_replace_recursive($defaults, $data),
 			]);
 		} catch (Throwable) {
 			$this->setResult(['ok' => false, 'missing' => false]);

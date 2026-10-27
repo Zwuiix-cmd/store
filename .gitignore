@@ -2,4 +2,5 @@
 /.vscode/
 /vendor
 /.php-cs-fixer.cache
+/.phpunit.result.cache
 /store.phar
